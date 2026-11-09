@@ -1,0 +1,34 @@
+# Copy to ~/.config/mcpmux/config.toml. Secret values are read from files at spawn time.
+listen = "127.0.0.1:7800"
+idle_timeout = "10m"
+startup_timeout = "90s"
+# launchd label used by `mcpmux install`/`uninstall` (also names the plist).
+# label = "co.pholtz.mcpmux"
+# launchd's PATH is minimal; list where node/uv/etc. live. Version-manager shims work too
+# (they resolve from cwd, which defaults to $HOME).
+path = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+
+# Each [servers.<name>] is served at http://127.0.0.1:7800/<name>/mcp.
+
+[servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "~/projects"]
+
+[servers.postgres]
+command = "uvx"
+args = ["postgres-mcp@0.3.0", "--access-mode=restricted"]
+# Fail calls immediately (instead of spawning) when nothing is listening, e.g. an SSH tunnel.
+requires_tcp = "127.0.0.1:5432"
+requires_tcp_hint = "start the tunnel with `ssh -fN db-tunnel`"
+idle_timeout = "30m"
+[servers.postgres.env]
+DATABASE_URI = { secret_file = "~/.secrets/postgres.txt", template = "postgresql://readonly:{secret}@127.0.0.1:5432/app" }
+
+[servers.mongodb]
+command = "npx"
+args = ["-y", "mongodb-mcp-server@3.2.2", "--readOnly"]
+# Hide tools that would mutate state shared by every session.
+deny_tools = ["disconnect"]
+max_rss_mb = 1024
+[servers.mongodb.env]
+MDB_MCP_CONNECTION_STRING = { secret_file = "~/.secrets/mongodb-uri.txt" }

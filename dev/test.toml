@@ -1,0 +1,14 @@
+# Dev config: `cargo run -- --config dev/test.toml serve` with a scratch HOME (see dev/smoke.sh).
+listen = "127.0.0.1:7899"
+idle_timeout = "20s"
+
+[servers.fake]
+command = "python3"
+args = ["-I", "FAKE"]
+deny_tools = ["connect"]
+
+[servers.tunnel]
+command = "python3"
+args = ["-I", "FAKE"]
+requires_tcp = "127.0.0.1:1"
+requires_tcp_hint = "try `tunnel up`"
