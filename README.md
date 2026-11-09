@@ -86,11 +86,3 @@ mcpmux uninstall   # unloads the LaunchAgent; config, token and cache stay
 ```
 
 Then point clients back at their stdio commands.
-
-## Develop
-
-`dev/smoke.sh` runs the daemon against `dev/fake-mcp.py` under a scratch `HOME`. It checks auth, lazy start, sharing across sessions, progress, cancellation, crash recovery, TCP preconditions, idle stop, and process-group cleanup, and takes about a minute.
-
-## License
-
-MIT

@@ -3,7 +3,7 @@ name = "mcpmux"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
-description = "Shares local stdio MCP servers across agent sessions over authenticated localhost HTTP"
+description = "Reduce agent resource usage by sharing local mcp servers"
 license = "MIT"
 
 [dependencies]
