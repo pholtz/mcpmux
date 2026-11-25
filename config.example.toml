@@ -2,8 +2,15 @@
 listen = "127.0.0.1:7800"
 idle_timeout = "10m"
 startup_timeout = "90s"
+# macOS notification when a server crashes, fails to start, or its tunnel drops (at most one per
+# server per 10 minutes). Never includes error text.
+# notify = true
+# Logs past this size (b, kb, mb, gb) are deleted and start fresh. With log_rollover = true the
+# old lines are kept as <name>.log.1 instead (one generation).
+# log_max_size = "10mb"
+# log_rollover = false
 # launchd label used by `mcpmux install`/`uninstall` (also names the plist).
-# label = "co.pholtz.mcpmux"
+# label = "local.mcpmux"
 # launchd's PATH is minimal; list where node/uv/etc. live. Version-manager shims work too
 # (they resolve from cwd, which defaults to $HOME).
 path = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
@@ -20,7 +27,12 @@ args = ["postgres-mcp@0.3.0", "--access-mode=restricted"]
 # Fail calls immediately (instead of spawning) when nothing is listening, e.g. an SSH tunnel.
 requires_tcp = "127.0.0.1:5432"
 requires_tcp_hint = "start the tunnel with `ssh -fN db-tunnel`"
+# Or open it: run on a call when the port is closed (or with T in the TUI), then wait up to 15s.
+# Output goes to the server's log. Runs with `path` as PATH.
+requires_tcp_cmd = "ssh -fN db-tunnel"
 idle_timeout = "30m"
+# Skip the idle stop during working hours (local time; may wrap midnight).
+keep_warm = "09:00-18:00"
 [servers.postgres.env]
 DATABASE_URI = { secret_file = "~/.secrets/postgres.txt", template = "postgresql://readonly:{secret}@127.0.0.1:5432/app" }
 

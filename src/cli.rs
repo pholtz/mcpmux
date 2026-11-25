@@ -123,7 +123,8 @@ pub fn uninstall(paths: &Paths) -> Result<()> {
 }
 
 fn mb(kb: Option<u64>) -> String {
-    kb.map(|k| format!("{}M", k / 1024)).unwrap_or_else(|| "-".into())
+    kb.map(|k| format!("{}M", k / 1024))
+        .unwrap_or_else(|| "-".into())
 }
 
 fn opt<T: ToString>(v: Option<T>) -> String {
@@ -168,8 +169,12 @@ pub fn status(paths: &Paths, json: bool) -> Result<()> {
             s.sessions,
             s.calls_1h,
             s.errors_1h,
-            s.p50_ms.map(|m| format!("{m}ms")).unwrap_or_else(|| "-".into()),
-            s.p95_ms.map(|m| format!("{m}ms")).unwrap_or_else(|| "-".into()),
+            s.p50_ms
+                .map(|m| format!("{m}ms"))
+                .unwrap_or_else(|| "-".into()),
+            s.p95_ms
+                .map(|m| format!("{m}ms"))
+                .unwrap_or_else(|| "-".into()),
         );
         if let Some(e) = &s.last_error {
             let retry = s
@@ -188,6 +193,18 @@ pub fn control(paths: &Paths, cmd: &str, server: Option<String>) -> Result<()> {
     Ok(())
 }
 
+pub fn reload(paths: &Paths) -> Result<()> {
+    let v = admin::call(&paths.socket(), "reload", None)?;
+    let changes = v["changes"].as_array().cloned().unwrap_or_default();
+    if changes.is_empty() {
+        println!("reload: no changes");
+    }
+    for c in changes {
+        println!("{}", c.as_str().unwrap_or_default());
+    }
+    Ok(())
+}
+
 pub fn logs(paths: &Paths, server: Option<String>) -> Result<()> {
     let file = match &server {
         Some(s) => paths.logs.join(format!("{s}.log")),
@@ -196,17 +213,21 @@ pub fn logs(paths: &Paths, server: Option<String>) -> Result<()> {
     if !file.exists() {
         bail!("{} does not exist yet", file.display());
     }
-    let err = Command::new("tail").args(["-n", "100", "-F"]).arg(&file).exec();
+    let err = Command::new("tail")
+        .args(["-n", "100", "-F"])
+        .arg(&file)
+        .exec();
     Err(err).context("running tail")
 }
 
 pub fn clients(paths: &Paths, client: Client) -> Result<()> {
     let cfg = Config::load(&paths.config)?;
     let base = format!("http://{}", cfg.listen);
-    let token = paths.token.display().to_string().replace(
-        &crate::config::home().display().to_string(),
-        "~",
-    );
+    let token = paths
+        .token
+        .display()
+        .to_string()
+        .replace(&crate::config::home().display().to_string(), "~");
     match client {
         Client::Claude => {
             println!("# Back up first: cp ~/.claude.json ~/.claude.json.pre-mcpmux");
@@ -304,7 +325,9 @@ pub fn check(paths: &Paths, live: bool) -> Result<()> {
 #[tokio::main]
 async fn check_live(cfg: &Config, paths: &Paths) -> Result<bool> {
     println!("\nlive handshake (spawns each server once, then stops it; refreshes the cache):");
-    let servers = build_servers(cfg, paths)?;
+    let (globals, servers) = build_servers(cfg, paths)?;
+    globals.write().unwrap().notify = false; // failures are printed here
+
     let mut failed = false;
     for (name, s) in &servers {
         let t = Instant::now();

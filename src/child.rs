@@ -46,21 +46,16 @@ pub struct SpawnSpec<'a> {
     pub path: Option<String>,
     pub cwd: String,
     pub stderr_log: &'a Path,
+    pub log_policy: crate::logs::Policy,
     pub generation: u64,
 }
-
-const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 
 impl Child {
     pub fn spawn(
         spec: SpawnSpec<'_>,
         events: mpsc::UnboundedSender<(u64, ChildEvent)>,
     ) -> Result<Arc<Child>> {
-        if let Ok(m) = std::fs::metadata(spec.stderr_log)
-            && m.len() > MAX_LOG_BYTES
-        {
-            let _ = std::fs::rename(spec.stderr_log, spec.stderr_log.with_extension("log.1"));
-        }
+        let _ = crate::logs::limit_closed(spec.stderr_log, spec.log_policy);
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -211,8 +206,10 @@ impl Child {
 
     pub fn cancel(&self, id: i64, reason: &str) {
         if self.pending.lock().unwrap().remove(&id).is_some() {
-            self.notify(json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
-                               "params": {"requestId": id, "reason": reason}}));
+            self.notify(
+                json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                               "params": {"requestId": id, "reason": reason}}),
+            );
         }
     }
 
