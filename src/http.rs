@@ -1,7 +1,7 @@
 //! MCP streamable HTTP (server side): POST for client messages, GET for the
 //! server-notification stream, DELETE to end a session.
 
-use crate::server::Server;
+use crate::{admin::Servers, server::Server};
 use axum::{
     Router,
     body::Bytes,
@@ -14,12 +14,12 @@ use axum::{
     routing::post,
 };
 use serde_json::{Value, json};
-use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Duration};
+use std::{convert::Infallible, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tokio_stream::{StreamExt, wrappers::BroadcastStream, wrappers::ReceiverStream};
 
 pub struct AppState {
-    pub servers: HashMap<String, Arc<Server>>,
+    pub servers: Servers,
     pub token: String,
 }
 
@@ -27,13 +27,19 @@ const SESSION: &str = "mcp-session-id";
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/{server}/mcp", post(post_mcp).get(get_mcp).delete(delete_mcp))
+        .route(
+            "/{server}/mcp",
+            post(post_mcp).get(get_mcp).delete(delete_mcp),
+        )
         .with_state(state)
 }
 
 fn deny(status: StatusCode, msg: &str) -> Response {
-    (status, Json(json!({"jsonrpc": "2.0", "id": null,
-                          "error": {"code": -32000, "message": msg}})))
+    (
+        status,
+        Json(json!({"jsonrpc": "2.0", "id": null,
+                          "error": {"code": -32000, "message": msg}})),
+    )
         .into_response()
 }
 
@@ -52,11 +58,7 @@ fn loopback_host(authority: &str) -> bool {
 
 /// Bearer token plus Host/Origin checks (blocks browser DNS rebinding).
 #[allow(clippy::result_large_err)]
-fn authorize(
-    state: &AppState,
-    headers: &HeaderMap,
-    name: &str,
-) -> Result<Arc<Server>, Response> {
+fn authorize(state: &AppState, headers: &HeaderMap, name: &str) -> Result<Arc<Server>, Response> {
     let host = headers
         .get(header::HOST)
         .and_then(|h| h.to_str().ok())
@@ -79,10 +81,15 @@ fn authorize(
         .and_then(|h| h.strip_prefix("Bearer "))
         .unwrap_or("");
     if !ct_eq(presented.trim().as_bytes(), state.token.as_bytes()) {
-        return Err(deny(StatusCode::UNAUTHORIZED, "missing or invalid bearer token"));
+        return Err(deny(
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid bearer token",
+        ));
     }
     state
         .servers
+        .read()
+        .unwrap()
         .get(name)
         .cloned()
         .ok_or_else(|| deny(StatusCode::NOT_FOUND, "unknown server"))
@@ -129,9 +136,15 @@ async fn post_mcp(
         }
     };
     if !msg.is_object() {
-        return deny(StatusCode::BAD_REQUEST, "JSON-RPC batches are not supported");
+        return deny(
+            StatusCode::BAD_REQUEST,
+            "JSON-RPC batches are not supported",
+        );
     }
-    let method = msg.get("method").and_then(Value::as_str).map(str::to_string);
+    let method = msg
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let is_request = msg.get("id").is_some_and(|i| !i.is_null()) && method.is_some();
     let session = headers
         .get(SESSION)

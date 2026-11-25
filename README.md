@@ -29,7 +29,10 @@ mcpmux install                           # creates ~/.config/mcpmux/token, loads
 listen = "127.0.0.1:7800"     # default
 idle_timeout = "10m"          # default; per-server override allowed
 startup_timeout = "60s"       # default
-label = "co.pholtz.mcpmux"    # launchd label (default)
+notify = true                 # default; macOS notification when a server crashes, fails to start, or its tunnel drops
+log_max_size = "10mb"         # default; units b, kb, mb, gb
+log_rollover = false          # default: a log past the limit is deleted; true keeps it as <name>.log.1
+label = "local.mcpmux"        # launchd label (default)
 path = ["/opt/homebrew/bin", "/usr/bin", "/bin"]   # PATH for children
 
 [servers.postgres]
@@ -37,6 +40,8 @@ command = "uvx"
 args = ["postgres-mcp", "--access-mode=restricted"]
 requires_tcp = "127.0.0.1:5432"          # fail fast instead of spawning if nothing listens
 requires_tcp_hint = "run `ssh -fN db-tunnel`"   # appended to that error
+requires_tcp_cmd = "ssh -fN db-tunnel"   # run when the port is closed on a call (or T in the TUI); waits 15s
+keep_warm = "09:00-18:00"                # no idle stop inside this local-time window
 deny_tools = ["some_tool"]               # hidden from tools/list and refused
 max_rss_mb = 1024                        # stop (restarts on next call) if the process group grows past this
 [servers.postgres.env]
@@ -45,6 +50,8 @@ DATABASE_URI = { secret_file = "~/.secrets/pg.txt", template = "postgresql://use
 ```
 
 Secrets are read from files when the server spawns. They never appear in the config, logs or cache. See [config.example.toml](config.example.toml).
+
+`mcpmux reload` (or `kill -HUP`) applies edits without a daemon restart. Timeouts, deny lists, tunnel settings and `notify` apply at once; a running server whose `command`, `args`, `env`, `cwd` or `path` changed restarts once its in-flight calls finish. Added servers appear and removed ones stop. Changing `listen` still needs a daemon restart.
 
 ## Point clients at it
 
@@ -60,11 +67,27 @@ Keep each server's name the same as its old stdio entry, and tool names and perm
 
 ```sh
 mcpmux status              # state, PID, RSS, idle countdown, sessions, calls/errors/latency (1h)
-mcpmux tui                 # same, live; s start · x stop · r restart · l log · q quit
+mcpmux tui                 # the same, live; ? lists every key and command
 mcpmux start <server>      # warm a server before you need it
 mcpmux restart <server>    # e.g. after a tunnel reconnects
+mcpmux pin <server>        # start it and skip idle stops until `unpin` or a daemon restart
+mcpmux reload              # apply config.toml edits
 mcpmux logs [server]       # daemon log, or one server's stderr
 ```
+
+### TUI
+
+The dashboard adds a savings estimate (RAM and processes not spawned per session), tunnel state, the token cost of each server's tool schemas, and 60-minute sparklines for calls, p95 and RSS.
+
+| Key | |
+|---|---|
+| `s` `x` `r` | start, stop (clears a failure), restart |
+| `p` / `T` | toggle pin / run `requires_tcp_cmd` |
+| `l` `L` | server log / daemon log: `/` find, `&` filter, `v` level, `f` follow, `o` pager, `y` copy |
+| `t` | tool inspector: token cost per tool; space toggles `deny_tools` |
+| `R` | reload config |
+| `:` | command line: `:restart all`, `:set github.keep_warm 09:00-18:00`, `:check --live`, `:clients claude`; tab completes |
+| `?` | help: keys (type to filter, enter runs), settings (edit config.toml in place, comments kept), guide |
 
 ## Files
 
@@ -73,11 +96,11 @@ mcpmux logs [server]       # daemon log, or one server's stderr
 | `~/.config/mcpmux/config.toml` | Servers (`--config` / `MCPMUX_CONFIG` to override) |
 | `~/.config/mcpmux/token` | Bearer token (0600) |
 | `~/.cache/mcpmux/<server>.json` | Cached `initialize` and list responses |
-| `~/Library/Logs/mcpmux/` | `mcpmux.log` (daemon), `<server>.log` (child stderr) |
+| `~/Library/Logs/mcpmux/` | `mcpmux.log` (daemon), `<server>.log` (child stderr); cleared past `log_max_size` (or rolled to `.log.1` with `log_rollover`) |
 | `~/.local/state/mcpmux/admin.sock` | CLI/TUI control socket |
 | `~/Library/LaunchAgents/<label>.plist` | Written by `install` |
 
-After you change a server's `command`, `args` or `env`, its cache is ignored until the next spawn. `mcpmux check --live` refreshes it.
+After you change a server's `command`, `args` or `env`, its cache is ignored until the next spawn. `mcpmux check --live` refreshes it. If a fresh spawn advertises a different version or tool set than the cache, connected clients get `notifications/tools/list_changed` and the TUI flags the server with `!`.
 
 ## Uninstall
 

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     net::SocketAddr,
@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "default_listen")]
@@ -24,11 +24,20 @@ pub struct Config {
     /// launchd label for `install`/`uninstall`; also names the plist.
     #[serde(default = "default_label")]
     pub label: String,
+    /// macOS notification when a server crashes or fails to start (at most one per server per 10m).
+    #[serde(default = "default_true")]
+    pub notify: bool,
+    /// Size at which a log is cleared, e.g. "10mb" (units b, kb, mb, gb).
+    #[serde(default = "default_log_max_size")]
+    pub log_max_size: String,
+    /// At the limit, keep the old contents as `<name>.log.1` instead of deleting them.
+    #[serde(default)]
+    pub log_rollover: bool,
     #[serde(default)]
     pub servers: BTreeMap<String, ServerConfig>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub command: String,
@@ -40,6 +49,10 @@ pub struct ServerConfig {
     pub requires_tcp: Option<String>,
     /// Appended to the error when `requires_tcp` isn't listening, e.g. "run `tunnel up`".
     pub requires_tcp_hint: Option<String>,
+    /// Run (via `sh -c`) when a call finds `requires_tcp` closed, then wait up to 15s for it.
+    pub requires_tcp_cmd: Option<String>,
+    /// Local-time window like "09:00-18:00" during which the idle stop is skipped.
+    pub keep_warm: Option<String>,
     #[serde(default)]
     pub deny_tools: Vec<String>,
     pub idle_timeout: Option<String>,
@@ -48,7 +61,7 @@ pub struct ServerConfig {
     pub protocol_version: Option<String>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 #[serde(untagged)]
 pub enum EnvValue {
     Plain(String),
@@ -65,21 +78,30 @@ fn default_listen() -> String {
 fn default_idle() -> String {
     "10m".into()
 }
+fn default_log_max_size() -> String {
+    "10mb".into()
+}
+fn default_true() -> bool {
+    true
+}
 fn default_startup() -> String {
     "60s".into()
 }
 pub fn default_label() -> String {
-    "co.pholtz.mcpmux".into()
+    "local.mcpmux".into()
 }
 
 pub const DEFAULT_PROTOCOL: &str = "2025-06-18";
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let cfg: Config =
-            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        Self::parse(&text).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    pub fn parse(text: &str) -> Result<Self> {
+        let cfg: Config = toml::from_str(text)?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -91,6 +113,7 @@ impl Config {
         }
         parse_duration(&self.idle_timeout).context("idle_timeout")?;
         parse_duration(&self.startup_timeout).context("startup_timeout")?;
+        parse_size(&self.log_max_size).context("log_max_size")?;
         for (name, s) in &self.servers {
             if name.is_empty()
                 || !name
@@ -101,6 +124,9 @@ impl Config {
             }
             if let Some(t) = &s.idle_timeout {
                 parse_duration(t).with_context(|| format!("{name}.idle_timeout"))?;
+            }
+            if let Some(w) = &s.keep_warm {
+                parse_window(w).with_context(|| format!("{name}.keep_warm"))?;
             }
             if let Some(t) = &s.requires_tcp {
                 t.parse::<SocketAddr>()
@@ -195,6 +221,70 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
         _ => bail!("duration {s:?}: unit must be s, m or h"),
     };
     Ok(Duration::from_secs(secs))
+}
+
+/// "10mb" → bytes. Units b, kb, mb, gb (powers of 1024), case-insensitive.
+pub fn parse_size(s: &str) -> Result<u64> {
+    let t = s.trim().to_ascii_lowercase();
+    let split = t
+        .find(|c: char| !c.is_ascii_digit())
+        .with_context(|| format!("size {s:?} needs a unit (b, kb, mb, gb)"))?;
+    let (n, unit) = t.split_at(split);
+    let n: u64 = n.parse().with_context(|| format!("bad size {s:?}"))?;
+    let mult: u64 = match unit.trim() {
+        "b" => 1,
+        "kb" => 1 << 10,
+        "mb" => 1 << 20,
+        "gb" => 1 << 30,
+        _ => bail!("size {s:?}: unit must be b, kb, mb or gb"),
+    };
+    match n.checked_mul(mult) {
+        Some(0) => bail!("size {s:?} must be more than 0"),
+        Some(b) => Ok(b),
+        None => bail!("size {s:?} is too large"),
+    }
+}
+
+/// "HH:MM-HH:MM" → (start, end) in minutes after midnight. The window may wrap past midnight.
+pub fn parse_window(s: &str) -> Result<(u32, u32)> {
+    let hm = |t: &str| -> Result<u32> {
+        let (h, m) = t
+            .trim()
+            .split_once(':')
+            .with_context(|| format!("{t:?} must be HH:MM"))?;
+        let (h, m): (u32, u32) = (h.parse()?, m.parse()?);
+        if h > 23 || m > 59 {
+            bail!("{t:?} is not a time of day");
+        }
+        Ok(h * 60 + m)
+    };
+    let (a, b) = s
+        .split_once('-')
+        .with_context(|| format!("{s:?} must look like 09:00-18:00"))?;
+    Ok((hm(a)?, hm(b)?))
+}
+
+/// Whether local time now falls inside a `keep_warm` window.
+pub fn in_window(spec: &str) -> bool {
+    let Ok((start, end)) = parse_window(spec) else {
+        return false;
+    };
+    let now = local_minutes();
+    if start <= end {
+        (start..end).contains(&now)
+    } else {
+        now >= start || now < end
+    }
+}
+
+fn local_minutes() -> u32 {
+    // SAFETY: localtime_r writes into the tm we own; a null time pointer is never passed.
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        (tm.tm_hour * 60 + tm.tm_min) as u32
+    }
 }
 
 pub fn home() -> PathBuf {

@@ -3,8 +3,10 @@
 
 use crate::{
     child::{Child, ChildEvent, SpawnSpec, token_key},
-    config::{Config, DEFAULT_PROTOCOL, ServerConfig, expand_tilde, home, parse_duration},
-    status::{CallView, ServerStatus},
+    config::{
+        Config, DEFAULT_PROTOCOL, ServerConfig, expand_tilde, home, in_window, parse_duration,
+    },
+    status::{CallView, History, ServerStatus, ToolView, Tunnel},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -12,12 +14,12 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 
 /// List methods answered from cache when called without a cursor.
 const CACHED_LISTS: [(&str, &str); 4] = [
@@ -27,6 +29,8 @@ const CACHED_LISTS: [(&str, &str); 4] = [
     ("resources/templates/list", "resources"),
 ];
 
+/// Daemon-wide settings. Replaced in place on reload.
+#[derive(Clone)]
 pub struct Globals {
     pub path: Option<String>,
     pub cwd: String,
@@ -34,7 +38,11 @@ pub struct Globals {
     pub startup_timeout: Duration,
     pub cache_dir: PathBuf,
     pub log_dir: PathBuf,
+    pub notify: bool,
+    pub log: crate::logs::Policy,
 }
+
+pub type SharedGlobals = Arc<RwLock<Globals>>;
 
 impl Globals {
     pub fn new(cfg: &Config, cache_dir: PathBuf, log_dir: PathBuf) -> anyhow::Result<Self> {
@@ -49,6 +57,8 @@ impl Globals {
             startup_timeout: parse_duration(&cfg.startup_timeout)?,
             cache_dir,
             log_dir,
+            notify: cfg.notify,
+            log: crate::logs::Policy::new(cfg)?,
         })
     }
 }
@@ -97,13 +107,24 @@ struct Inner {
     sessions: HashMap<String, SessionInfo>,
     /// (session, client request id) → upstream id, for client cancellation.
     client_reqs: HashMap<(String, String), i64>,
+    /// Held warm by the user: no idle stop (the memory guard still applies).
+    pinned: bool,
+    /// Spawn-affecting config changed while running; restart once in-flight calls drain.
+    restart_pending: bool,
+    tunnel_up: Option<bool>,
+    /// Latest RSS sample of the running child, and of the last run once stopped.
+    rss_kb: Option<u64>,
+    last_rss_kb: Option<u64>,
+    /// One RSS sample (MB) per minute, newest last, with the minute it was taken.
+    rss_hist: VecDeque<(u64, u64)>,
+    cache_note: Option<String>,
+    last_notified: Option<Instant>,
 }
 
 pub struct Server {
     pub name: String,
-    cfg: ServerConfig,
-    globals: Arc<Globals>,
-    idle_timeout: Duration,
+    cfg: RwLock<ServerConfig>,
+    globals: SharedGlobals,
     inner: Mutex<Inner>,
     start_lock: tokio::sync::Mutex<()>,
     cache: Mutex<Option<Cache>>,
@@ -111,6 +132,8 @@ pub struct Server {
     pub broadcast: broadcast::Sender<Value>,
     events: mpsc::UnboundedSender<(u64, ChildEvent)>,
     progress_seq: AtomicU64,
+    /// Set when reload removes the server; ends its background tasks.
+    retire: watch::Sender<bool>,
 }
 
 pub type Reply = Value;
@@ -123,6 +146,10 @@ fn rpc_result(id: &Value, result: Value) -> Reply {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
+fn minute_now() -> u64 {
+    now_unix() / 60
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -131,19 +158,13 @@ fn now_unix() -> u64 {
 }
 
 impl Server {
-    pub fn new(name: String, cfg: ServerConfig, globals: Arc<Globals>) -> Arc<Self> {
-        let idle_timeout = cfg
-            .idle_timeout
-            .as_deref()
-            .and_then(|t| parse_duration(t).ok())
-            .unwrap_or(globals.idle_timeout);
+    pub fn new(name: String, cfg: ServerConfig, globals: SharedGlobals) -> Arc<Self> {
         let (events, events_rx) = mpsc::unbounded_channel();
         let server = Arc::new(Server {
             cache: Mutex::new(None),
             name,
-            cfg,
+            cfg: RwLock::new(cfg),
             globals,
-            idle_timeout,
             inner: Mutex::new(Inner {
                 state: State::Stopped,
                 child: None,
@@ -157,21 +178,108 @@ impl Server {
                 calls: VecDeque::new(),
                 sessions: HashMap::new(),
                 client_reqs: HashMap::new(),
+                pinned: false,
+                restart_pending: false,
+                tunnel_up: None,
+                rss_kb: None,
+                last_rss_kb: None,
+                rss_hist: VecDeque::new(),
+                cache_note: None,
+                last_notified: None,
             }),
             start_lock: tokio::sync::Mutex::new(()),
             broadcast: broadcast::channel(64).0,
             events,
             progress_seq: AtomicU64::new(1),
+            retire: watch::channel(false).0,
         });
         server.load_cache();
         tokio::spawn(server.clone().event_loop(events_rx));
         server
     }
 
+    fn cfg(&self) -> std::sync::RwLockReadGuard<'_, ServerConfig> {
+        self.cfg.read().unwrap()
+    }
+
+    fn idle_timeout(&self) -> Duration {
+        self.cfg()
+            .idle_timeout
+            .as_deref()
+            .and_then(|t| parse_duration(t).ok())
+            .unwrap_or_else(|| self.globals.read().unwrap().idle_timeout)
+    }
+
+    fn log_path(&self) -> PathBuf {
+        let dir = self.globals.read().unwrap().log_dir.clone();
+        dir.join(format!("{}.log", self.name))
+    }
+
+    /// Apply a reloaded config. Returns a description of what changed, if anything.
+    /// `respawn` forces a restart (daemon-wide PATH or cwd changed).
+    pub fn apply(&self, new: ServerConfig, respawn: bool) -> Option<String> {
+        let old = self.cfg().clone();
+        let (a, b) = (
+            serde_json::to_value(&old).unwrap_or_default(),
+            serde_json::to_value(&new).unwrap_or_default(),
+        );
+        let keys: Vec<&str> = b
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(k, v)| a.get(k.as_str()) != Some(v))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        if keys.is_empty() && !respawn {
+            return None;
+        }
+        let spawn_keys = ["command", "args", "env", "cwd", "protocol_version"];
+        let respawn = respawn || keys.iter().any(|k| spawn_keys.contains(k));
+        let deny_changed = keys.contains(&"deny_tools");
+        *self.cfg.write().unwrap() = new;
+        let what = if keys.is_empty() {
+            "PATH/cwd".to_string()
+        } else {
+            keys.join(", ")
+        };
+        if deny_changed {
+            // Clients re-fetch tools/list and see the new filter.
+            let _ = self
+                .broadcast
+                .send(json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}));
+        }
+        if !respawn {
+            return Some(format!("{}: {what} updated", self.name));
+        }
+        let mut inner = self.inner.lock().unwrap();
+        if inner.child.is_some() {
+            inner.restart_pending = true;
+            Some(format!("{}: {what} changed; restarts when idle", self.name))
+        } else {
+            drop(inner);
+            *self.cache.lock().unwrap() = None;
+            self.load_cache(); // drops a cache whose fingerprint no longer matches
+            Some(format!(
+                "{}: {what} changed; applies on next start",
+                self.name
+            ))
+        }
+    }
+
+    /// Stop background tasks; the server has been removed from the config.
+    pub fn retire(&self) {
+        let _ = self.retire.send(true);
+    }
+
+    pub fn set_pinned(&self, on: bool) {
+        self.inner.lock().unwrap().pinned = on;
+    }
+
     // ---------- cache ----------
 
     fn cache_path(&self) -> PathBuf {
-        self.globals.cache_dir.join(format!("{}.json", self.name))
+        let dir = self.globals.read().unwrap().cache_dir.clone();
+        dir.join(format!("{}.json", self.name))
     }
 
     fn load_cache(&self) {
@@ -179,10 +287,12 @@ impl Server {
             return;
         };
         match serde_json::from_str::<Cache>(&text) {
-            Ok(c) if c.fingerprint == self.cfg.fingerprint() => {
+            Ok(c) if c.fingerprint == self.cfg().fingerprint() => {
                 *self.cache.lock().unwrap() = Some(c);
             }
-            Ok(_) => tracing::info!(server = %self.name, "config changed; ignoring cached handshake"),
+            Ok(_) => {
+                tracing::info!(server = %self.name, "config changed; ignoring cached handshake")
+            }
             Err(e) => tracing::warn!(server = %self.name, "bad cache file: {e}"),
         }
     }
@@ -199,7 +309,9 @@ impl Server {
         }
     }
 
-    async fn refresh_lists(&self, child: &Child, initialize: Value) {
+    /// Re-fetch the list endpoints and save the cache. `fresh_spawn` compares against the
+    /// previous cache: clients that already fetched a stale list are told to re-fetch.
+    async fn refresh_lists(&self, child: &Child, initialize: Value, fresh_spawn: bool) {
         let caps = initialize.get("capabilities").cloned().unwrap_or_default();
         let mut lists = BTreeMap::new();
         for (method, cap) in CACHED_LISTS {
@@ -217,13 +329,23 @@ impl Server {
             }
         }
         let cache = Cache {
-            fingerprint: self.cfg.fingerprint(),
+            fingerprint: self.cfg().fingerprint(),
             initialize,
             lists,
             updated: now_unix(),
         };
         self.save_cache(&cache);
-        *self.cache.lock().unwrap() = Some(cache);
+        let old = self.cache.lock().unwrap().replace(cache.clone());
+        if fresh_spawn
+            && let Some(old) = old
+            && let Some(note) = cache_diff(&old, &cache)
+        {
+            tracing::info!(server = %self.name, "cache was stale: {note}");
+            self.inner.lock().unwrap().cache_note = Some(note);
+            let _ = self
+                .broadcast
+                .send(json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}));
+        }
     }
 
     fn cached_initialize(&self) -> Option<Value> {
@@ -247,17 +369,48 @@ impl Server {
     }
 
     fn filter_tools(&self, method: &str, mut result: Value) -> Value {
+        let cfg = self.cfg();
         if method == "tools/list"
-            && !self.cfg.deny_tools.is_empty()
+            && !cfg.deny_tools.is_empty()
             && let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut)
         {
             tools.retain(|t| {
                 t.get("name")
                     .and_then(Value::as_str)
-                    .is_none_or(|n| !self.cfg.deny_tools.iter().any(|d| d == n))
+                    .is_none_or(|n| !cfg.deny_tools.iter().any(|d| d == n))
             });
         }
         result
+    }
+
+    /// Every cached tool, denied ones included, with a rough token cost.
+    pub fn tools(&self) -> Option<Vec<ToolView>> {
+        let deny = self.cfg().deny_tools.clone();
+        let cache = self.cache.lock().unwrap();
+        let tools = cache
+            .as_ref()?
+            .lists
+            .get("tools/list")?
+            .get("tools")?
+            .as_array()?;
+        Some(
+            tools
+                .iter()
+                .map(|t| {
+                    let name = t.get("name").and_then(Value::as_str).unwrap_or("?");
+                    ToolView {
+                        name: name.to_string(),
+                        description: t
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        tokens: est_tokens(t),
+                        denied: deny.iter().any(|d| d == name),
+                    }
+                })
+                .collect(),
+        )
     }
 
     // ---------- lifecycle ----------
@@ -289,6 +442,7 @@ impl Server {
         }
         let generation = {
             let mut inner = self.inner.lock().unwrap();
+            inner.restart_pending = false;
             if let Some(at) = inner.retry_at
                 && Instant::now() < at
             {
@@ -323,6 +477,12 @@ impl Server {
                 inner.state = State::Failed;
                 self.record_failure(&mut inner, e.clone());
                 tracing::warn!(server = %self.name, "start failed: {e}");
+                let body = if e.starts_with("nothing listening") {
+                    "tunnel is down"
+                } else {
+                    "failed to start"
+                };
+                self.alert(&mut inner, body);
                 Err(e)
             }
         }
@@ -339,53 +499,67 @@ impl Server {
         inner.last_error = Some(err);
     }
 
+    /// macOS notification, at most once per server per 10 minutes. The body never carries
+    /// error text: it can echo server output.
+    fn alert(&self, inner: &mut Inner, body: &str) {
+        if !self.globals.read().unwrap().notify
+            || inner
+                .last_notified
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(600))
+        {
+            return;
+        }
+        inner.last_notified = Some(Instant::now());
+        notify(&format!("mcpmux: {}", self.name), body);
+    }
+
     async fn spawn_and_handshake(&self, generation: u64) -> Result<Arc<Child>, String> {
-        if let Some(addr) = &self.cfg.requires_tcp {
-            let ok = tokio::time::timeout(
-                Duration::from_secs(2),
-                tokio::net::TcpStream::connect(addr.as_str()),
-            )
-            .await
-            .is_ok_and(|r| r.is_ok());
+        let cfg = self.cfg().clone();
+        let globals = self.globals.read().unwrap().clone();
+        let log = self.log_path();
+        if let Some(addr) = &cfg.requires_tcp {
+            let mut ok = probe(addr, Duration::from_secs(2)).await;
+            let mut ran = String::new();
+            if !ok && let Some(cmd) = &cfg.requires_tcp_cmd {
+                ok = self.run_tunnel_cmd(cmd, addr).await;
+                ran = format!("; ran `{cmd}`");
+            }
+            self.inner.lock().unwrap().tunnel_up = Some(ok);
             if !ok {
-                let hint = self
-                    .cfg
+                let hint = cfg
                     .requires_tcp_hint
                     .as_ref()
                     .map(|h| format!(" ({h})"))
                     .unwrap_or_default();
-                return Err(format!("nothing listening on {addr}; is the tunnel up?{hint}"));
+                return Err(format!(
+                    "nothing listening on {addr}{ran}; is the tunnel up?{hint}"
+                ));
             }
         }
-        let env = self.cfg.resolve_env().map_err(|e| format!("{e:#}"))?;
-        let log = self.globals.log_dir.join(format!("{}.log", self.name));
-        let cwd = self
-            .cfg
+        let env = cfg.resolve_env().map_err(|e| format!("{e:#}"))?;
+        let cwd = cfg
             .cwd
             .as_deref()
             .map(expand_tilde)
-            .unwrap_or_else(|| self.globals.cwd.clone());
+            .unwrap_or_else(|| globals.cwd.clone());
         let child = Child::spawn(
             SpawnSpec {
-                command: &self.cfg.command,
-                args: self.cfg.args_expanded(),
+                command: &cfg.command,
+                args: cfg.args_expanded(),
                 env,
-                path: self.globals.path.clone(),
+                path: globals.path.clone(),
                 cwd,
                 stderr_log: &log,
+                log_policy: globals.log,
                 generation,
             },
             self.events.clone(),
         )
         .map_err(|e| format!("{e:#}"))?;
 
-        let protocol = self
-            .cfg
-            .protocol_version
-            .as_deref()
-            .unwrap_or(DEFAULT_PROTOCOL);
+        let protocol = cfg.protocol_version.as_deref().unwrap_or(DEFAULT_PROTOCOL);
         let init = tokio::time::timeout(
-            self.globals.startup_timeout,
+            globals.startup_timeout,
             child.request(
                 "initialize",
                 json!({
@@ -406,14 +580,102 @@ impl Server {
                 kill_group(&child).await;
                 return Err(format!(
                     "no initialize response within {}s (see {})",
-                    self.globals.startup_timeout.as_secs(),
+                    globals.startup_timeout.as_secs(),
                     log.display()
                 ));
             }
         };
         child.notify(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
-        self.refresh_lists(&child, init).await;
+        self.refresh_lists(&child, init, true).await;
         Ok(child)
+    }
+
+    /// Run `requires_tcp_cmd` and wait up to 15s for the port. The command is left running
+    /// (a foreground tunnel must outlive this call); its output goes to the server's log.
+    async fn run_tunnel_cmd(&self, cmd: &str, addr: &str) -> bool {
+        let globals = self.globals.read().unwrap().clone();
+        let log = self.log_path();
+        tracing::info!(server = %self.name, "{addr} closed; running requires_tcp_cmd");
+        let out = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log);
+        let mut c = tokio::process::Command::new("/bin/sh");
+        c.arg("-c")
+            .arg(cmd)
+            .current_dir(&globals.cwd)
+            .stdin(std::process::Stdio::null());
+        if let Some(p) = &globals.path {
+            c.env("PATH", p);
+        }
+        if let Ok(f) = out {
+            use std::io::Write;
+            let mut f = f;
+            let _ = writeln!(f, "[mcpmux] {addr} closed; running `{cmd}`");
+            if let Ok(f2) = f.try_clone() {
+                c.stdout(f2);
+            }
+            c.stderr(f);
+        }
+        match c.spawn() {
+            Ok(mut child) => {
+                tokio::spawn(async move {
+                    let _ = child.wait().await;
+                });
+            }
+            Err(e) => {
+                tracing::warn!(server = %self.name, "requires_tcp_cmd: {e}");
+                return false;
+            }
+        }
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if probe(addr, Duration::from_millis(500)).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Run the tunnel command now (TUI `T`). Errors if none is configured.
+    pub async fn tunnel_up(&self) -> Result<bool, String> {
+        let (addr, cmd) = {
+            let cfg = self.cfg();
+            match (&cfg.requires_tcp, &cfg.requires_tcp_cmd) {
+                (Some(a), Some(c)) => (a.clone(), c.clone()),
+                _ => return Err(format!("{} has no requires_tcp_cmd", self.name)),
+            }
+        };
+        let ok = probe(&addr, Duration::from_millis(500)).await
+            || self.run_tunnel_cmd(&cmd, &addr).await;
+        self.inner.lock().unwrap().tunnel_up = Some(ok);
+        Ok(ok)
+    }
+
+    /// Monitor hook: refresh the tunnel state.
+    pub async fn probe_tunnel(&self) {
+        let Some(addr) = self.cfg().requires_tcp.clone() else {
+            return;
+        };
+        let up = probe(&addr, Duration::from_millis(500)).await;
+        self.inner.lock().unwrap().tunnel_up = Some(up);
+    }
+
+    /// Monitor hook: record this server's RSS from a `group_rss_kb` sample.
+    pub fn sample_rss(&self, rss: &HashMap<i32, u64>) {
+        let mut inner = self.inner.lock().unwrap();
+        let kb = inner.child.as_ref().and_then(|c| rss.get(&c.pid).copied());
+        inner.rss_kb = kb;
+        if kb.is_some() {
+            inner.last_rss_kb = kb;
+        }
+        let minute = minute_now();
+        if inner.rss_hist.back().is_none_or(|(m, _)| *m < minute) {
+            inner.rss_hist.push_back((minute, kb.unwrap_or(0) / 1024));
+            while inner.rss_hist.len() > 60 {
+                inner.rss_hist.pop_front();
+            }
+        }
     }
 
     pub async fn stop(&self, reason: &str) -> bool {
@@ -437,6 +699,7 @@ impl Server {
         let mut inner = self.inner.lock().unwrap();
         inner.state = State::Stopped;
         inner.started_at = None;
+        inner.rss_kb = None;
         inner.failures = 0;
         inner.retry_at = None;
         inner.client_reqs.clear();
@@ -444,7 +707,12 @@ impl Server {
     }
 
     async fn event_loop(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<(u64, ChildEvent)>) {
-        while let Some((generation, event)) = rx.recv().await {
+        let mut retire = self.retire.subscribe();
+        loop {
+            let (generation, event) = tokio::select! {
+                e = rx.recv() => match e { Some(e) => e, None => return },
+                _ = retire.changed() => return,
+            };
             let current = {
                 let inner = self.inner.lock().unwrap();
                 inner
@@ -459,15 +727,20 @@ impl Server {
                     // Unexpected exit. Clear out any stragglers left in the group.
                     child.signal_group(libc::SIGKILL);
                     let mut inner = self.inner.lock().unwrap();
-                    if inner.started_at.is_some_and(|t| t.elapsed() > Duration::from_secs(60)) {
+                    if inner
+                        .started_at
+                        .is_some_and(|t| t.elapsed() > Duration::from_secs(60))
+                    {
                         inner.failures = 0;
                     }
                     inner.child = None;
                     inner.started_at = None;
                     inner.state = State::Failed;
+                    inner.rss_kb = None;
                     inner.client_reqs.clear();
                     tracing::warn!(server = %self.name, "child {why}");
                     self.record_failure(&mut inner, format!("child {why}"));
+                    self.alert(&mut inner, "crashed");
                 }
                 ChildEvent::Notification(msg) => {
                     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
@@ -475,7 +748,7 @@ impl Server {
                         && let Some(child) = &current
                     {
                         let init = self.cached_initialize().unwrap_or_default();
-                        self.refresh_lists(child, init).await;
+                        self.refresh_lists(child, init, false).await;
                     }
                     if method == "notifications/message" {
                         continue; // server logs; would interleave across sessions
@@ -486,12 +759,16 @@ impl Server {
         }
     }
 
-    /// Idle stop and memory guard. Runs for the daemon's lifetime.
+    /// Idle stop, memory guard and pending restarts. Runs until the server is retired.
     pub async fn reaper(self: Arc<Self>) {
         let mut tick = tokio::time::interval(Duration::from_secs(15));
+        let mut retire = self.retire.subscribe();
         loop {
-            tick.tick().await;
-            let (idle, pid) = {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = retire.changed() => return,
+            }
+            let (idle, rss_kb, pinned, restart) = {
                 let mut inner = self.inner.lock().unwrap();
                 inner
                     .sessions
@@ -505,19 +782,30 @@ impl Server {
                 }
                 (
                     inner.last_activity.elapsed(),
-                    inner.child.as_ref().map(|c| c.pid),
+                    inner.rss_kb,
+                    inner.pinned,
+                    inner.restart_pending,
                 )
             };
-            if !self.idle_timeout.is_zero() && idle >= self.idle_timeout {
+            if restart {
+                self.stop("config changed").await;
+                if pinned {
+                    let _ = self.ensure_child().await;
+                }
+                continue;
+            }
+            let idle_timeout = self.idle_timeout();
+            let warm = pinned || self.cfg().keep_warm.as_deref().is_some_and(in_window);
+            if !warm && !idle_timeout.is_zero() && idle >= idle_timeout {
                 self.stop("idle").await;
                 continue;
             }
-            if let (Some(limit), Some(pid)) = (self.cfg.max_rss_mb, pid) {
-                let rss_kb = group_rss_kb().get(&pid).copied().unwrap_or(0);
-                if rss_kb / 1024 > limit {
-                    tracing::warn!(server = %self.name, rss_mb = rss_kb / 1024, limit, "over memory limit");
-                    self.stop("memory limit").await;
-                }
+            let limit = self.cfg().max_rss_mb;
+            if let (Some(limit), Some(rss_kb)) = (limit, rss_kb)
+                && rss_kb / 1024 > limit
+            {
+                tracing::warn!(server = %self.name, rss_mb = rss_kb / 1024, limit, "over memory limit");
+                self.stop("memory limit").await;
             }
         }
     }
@@ -603,7 +891,7 @@ impl Server {
             }
             "tools/call" => {
                 let tool = msg.pointer("/params/name").and_then(Value::as_str);
-                if tool.is_some_and(|t| self.cfg.deny_tools.iter().any(|d| d == t)) {
+                if tool.is_some_and(|t| self.cfg().deny_tools.iter().any(|d| d == t)) {
                     return rpc_error(&id, -32602, "tool is disabled by mcpmux");
                 }
             }
@@ -642,15 +930,13 @@ impl Server {
         let mut route = None;
         if let Some(token) = msg.pointer("/params/_meta/progressToken").cloned() {
             if let Some(sink) = progress {
-                let upstream = format!(
-                    "mux-{}",
-                    self.progress_seq.fetch_add(1, Ordering::SeqCst)
-                );
+                let upstream = format!("mux-{}", self.progress_seq.fetch_add(1, Ordering::SeqCst));
                 child.add_progress_route(upstream.clone(), token, sink);
                 msg["params"]["_meta"]["progressToken"] = json!(upstream);
                 route = Some(upstream);
-            } else if let Some(meta) =
-                msg.pointer_mut("/params/_meta").and_then(Value::as_object_mut)
+            } else if let Some(meta) = msg
+                .pointer_mut("/params/_meta")
+                .and_then(Value::as_object_mut)
             {
                 meta.remove("progressToken");
             }
@@ -668,7 +954,11 @@ impl Server {
             }
             Err(_) => {
                 guard.finish(false);
-                rpc_error(&id, -32603, format!("{} exited during the request", self.name))
+                rpc_error(
+                    &id,
+                    -32603,
+                    format!("{} exited during the request", self.name),
+                )
             }
         }
     }
@@ -691,6 +981,9 @@ impl Server {
     // ---------- status ----------
 
     pub fn status(&self, rss: &HashMap<i32, u64>) -> ServerStatus {
+        // Taken before the locks below: std's RwLock must not be read-locked twice per thread.
+        let idle_timeout = self.idle_timeout();
+        let log = self.log_path();
         let inner = self.inner.lock().unwrap();
         let cache = self.cache.lock().unwrap();
         let pid = inner.child.as_ref().map(|c| c.pid);
@@ -698,14 +991,15 @@ impl Server {
         ms.sort_unstable();
         let pct = |p: f64| (!ms.is_empty()).then(|| ms[((ms.len() - 1) as f64 * p) as usize]);
         let active = Duration::from_secs(30 * 60);
+        let cfg = self.cfg();
         ServerStatus {
             name: self.name.clone(),
             state: format!("{:?}", inner.state).to_lowercase(),
             pid,
-            rss_kb: pid.and_then(|p| rss.get(&p).copied()),
+            rss_kb: pid.and_then(|p| rss.get(&p).copied()).or(inner.rss_kb),
             uptime_s: inner.started_at.map(|t| t.elapsed().as_secs()),
             idle_s: (inner.state == State::Ready).then(|| inner.last_activity.elapsed().as_secs()),
-            idle_timeout_s: self.idle_timeout.as_secs(),
+            idle_timeout_s: idle_timeout.as_secs(),
             inflight: inner.inflight,
             sessions: inner
                 .sessions
@@ -752,13 +1046,135 @@ impl Server {
                     ok: c.ok,
                 })
                 .collect(),
-            log: self
-                .globals
-                .log_dir
-                .join(format!("{}.log", self.name))
-                .display()
-                .to_string(),
+            log: log.display().to_string(),
+            pinned: inner.pinned,
+            keep_warm: cfg.keep_warm.clone(),
+            restart_pending: inner.restart_pending,
+            tunnel: cfg.requires_tcp.as_ref().map(|addr| Tunnel {
+                addr: addr.clone(),
+                up: inner.tunnel_up,
+                hint: cfg.requires_tcp_hint.clone(),
+                cmd: cfg.requires_tcp_cmd.clone(),
+            }),
+            last_rss_kb: inner.last_rss_kb,
+            tool_tokens: cache.as_ref().and_then(|c| {
+                let tools = c.lists.get("tools/list")?.get("tools")?.as_array()?;
+                Some(
+                    tools
+                        .iter()
+                        .filter(|t| {
+                            t.get("name")
+                                .and_then(Value::as_str)
+                                .is_none_or(|n| !cfg.deny_tools.iter().any(|d| d == n))
+                        })
+                        .map(est_tokens)
+                        .sum(),
+                )
+            }),
+            cache_note: inner.cache_note.clone(),
+            history: history(&inner),
         }
+    }
+}
+
+/// Per-minute series for the last hour, oldest first.
+fn history(inner: &Inner) -> History {
+    let now = minute_now();
+    let ago = |t: Instant| (t.elapsed().as_secs() / 60) as usize;
+    let mut h = History {
+        calls: vec![0; 60],
+        errors: vec![0; 60],
+        p95_ms: vec![0; 60],
+        rss_mb: vec![0; 60],
+    };
+    let mut lat: Vec<Vec<u64>> = vec![vec![]; 60];
+    for c in &inner.calls {
+        let a = ago(c.at);
+        if a < 60 {
+            h.calls[59 - a] += 1;
+            if !c.ok {
+                h.errors[59 - a] += 1;
+            }
+            lat[59 - a].push(c.ms);
+        }
+    }
+    for (i, mut l) in lat.into_iter().enumerate() {
+        if !l.is_empty() {
+            l.sort_unstable();
+            h.p95_ms[i] = l[((l.len() - 1) as f64 * 0.95) as usize];
+        }
+    }
+    for (m, mb) in &inner.rss_hist {
+        let a = now.saturating_sub(*m) as usize;
+        if a < 60 {
+            h.rss_mb[59 - a] = *mb;
+        }
+    }
+    h
+}
+
+/// Rough LLM token count of a tool definition: its JSON length / 4.
+fn est_tokens(tool: &Value) -> u64 {
+    (tool.to_string().len() as u64).div_ceil(4)
+}
+
+/// What changed between two cached handshakes, if the version or tool set did.
+fn cache_diff(old: &Cache, new: &Cache) -> Option<String> {
+    let ver = |c: &Cache| {
+        c.initialize
+            .pointer("/serverInfo/version")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_string()
+    };
+    let names = |c: &Cache| -> std::collections::BTreeSet<String> {
+        c.lists
+            .get("tools/list")
+            .and_then(|l| l.get("tools"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
+            .collect()
+    };
+    let (ov, nv) = (ver(old), ver(new));
+    let (on, nn) = (names(old), names(new));
+    let mut parts = vec![];
+    if ov != nv {
+        parts.push(format!("version {ov} → {nv}"));
+    }
+    let added = nn.difference(&on).count();
+    let removed = on.difference(&nn).count();
+    if added + removed > 0 {
+        parts.push(format!("tools +{added} −{removed}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+async fn probe(addr: &str, timeout: Duration) -> bool {
+    tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr))
+        .await
+        .is_ok_and(|r| r.is_ok())
+}
+
+/// Post a macOS notification. Title and body go through argv, never into the script.
+fn notify(title: &str, body: &str) {
+    let r = std::process::Command::new("/usr/bin/osascript")
+        .args([
+            "-e",
+            "on run argv",
+            "-e",
+            "display notification (item 2 of argv) with title (item 1 of argv)",
+            "-e",
+            "end run",
+            title,
+            body,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if let Ok(mut c) = r {
+        std::thread::spawn(move || c.wait());
     }
 }
 
@@ -866,4 +1282,3 @@ pub fn group_rss_kb() -> HashMap<i32, u64> {
     }
     out
 }
-
